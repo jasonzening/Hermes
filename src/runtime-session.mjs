@@ -62,6 +62,9 @@ export const TERMINAL_RUNTIME_STATES = new Set([
   "SESSION_FAILED",
   "SESSION_TIMEOUT",
   "SESSION_CANCELLED",
+  // R1C: process exited 0 but no explicit PHASE_TERMINAL task-complete event
+  // task_state remains TASK_IN_PROGRESS — ProcessExit != TaskCompletion
+  "SESSION_EXITED_NO_TERMINAL",
 ]);
 
 export const ACTIVE_RUNTIME_STATES = new Set([
@@ -127,6 +130,8 @@ export const RUNTIME_SESSION_EVENT_TYPES = {
   SESSION_FAILED:           "runtime_session.failed",
   SESSION_TIMEOUT:          "runtime_session.timeout",
   SESSION_CANCELLED:        "runtime_session.cancelled",
+  // R1C: process exited 0 but without explicit PHASE_TERMINAL task-complete event
+  SESSION_EXITED_NO_TERMINAL: "runtime_session.exited_no_terminal",
 };
 
 // ─── Default paths ─────────────────────────────────────────────────────────
@@ -151,7 +156,8 @@ export const DEFAULT_RUNTIME_SESSION_OUT_DIR = "artifacts/runtime-sessions";
  */
 export function createRuntimeSession(params) {
   const now = params.runAt ?? new Date().toISOString();
-  const sessionId = params.sessionId ?? `rtsess_${randomUUID()}`;
+  // R1B: preserve session_id across recovery by passing existingSessionId
+  const sessionId = params.existingSessionId ?? params.sessionId ?? `rtsess_${randomUUID()}`;
 
   return {
     schema_version: RUNTIME_SESSION_SCHEMA_VERSION,
@@ -611,6 +617,52 @@ export function markSessionCancelled(session, { reason, ts = null } = {}) {
     current_phase: "PHASE_TERMINAL",
     terminal_state: "SESSION_CANCELLED",
     terminal_reason: reason ?? "externally_cancelled",
+    terminal_at: now,
+    last_event_seq: event.seq,
+    last_event_id: event.event_id,
+    last_event_type: event.type,
+    _events: [...session._events, event],
+  };
+}
+
+// ─── R1C: ProcessExit != TaskCompletion ──────────────────────────────────
+
+/**
+ * Mark session as exited with code 0 but WITHOUT an explicit PHASE_TERMINAL
+ * task-complete runtime event. This is NOT TASK_COMPLETED.
+ *
+ * ARF-001 LAW-7: Process exit alone is not evidence readiness or task completion.
+ * The supervisor MUST NOT set task_state=TASK_COMPLETED when the process exits 0
+ * but no PHASE_TERMINAL event was emitted by the child.
+ *
+ * task_state remains TASK_IN_PROGRESS to signal that task outcome is UNKNOWN.
+ * The record is terminal (no more transitions) but the task is not complete.
+ */
+export function markSessionExitedNoTerminal(session, { exitCode = 0, reason, ts = null } = {}) {
+  assertNotTerminal(session);
+  const now = ts ?? new Date().toISOString();
+  const event = buildSessionEvent({
+    sessionId: session.session_id,
+    seq: session.last_event_seq + 1,
+    type: RUNTIME_SESSION_EVENT_TYPES.SESSION_EXITED_NO_TERMINAL,
+    payload: {
+      exit_code: exitCode,
+      reason: reason ?? "process_exited_0_without_PHASE_TERMINAL_event",
+      law_7_note: "ProcessExit != TaskCompletion — task outcome is UNKNOWN",
+    },
+    now,
+  });
+  return {
+    ...session,
+    runtime_state: "SESSION_EXITED_NO_TERMINAL",
+    agent_state: "AGENT_TERMINAL",
+    // R1C: task_state MUST NOT be TASK_COMPLETED — leave as TASK_IN_PROGRESS
+    // task_state: "TASK_IN_PROGRESS" (unchanged — we do not escalate to COMPLETED)
+    current_phase: "PHASE_TERMINAL",
+    process_exited_at: now,
+    process_exit_code: exitCode,
+    terminal_state: "SESSION_EXITED_NO_TERMINAL",
+    terminal_reason: reason ?? "process_exited_0_without_PHASE_TERMINAL_event",
     terminal_at: now,
     last_event_seq: event.seq,
     last_event_id: event.event_id,
