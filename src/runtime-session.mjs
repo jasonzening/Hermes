@@ -188,11 +188,12 @@ export function createRuntimeSession(params) {
     process_exit_code: null,
 
     // Checkpoint / native session (from adapter)
-    checkpoint_ref: null,
+    checkpoint_ref: params.initialCheckpointRef ?? null,
     native_session_ref: null,   // provider-specific; opaque here
 
     // Event cursor (for reconnect reconciliation)
-    last_event_seq: 0,
+    // R2B: On recovery, cursor starts after parent session's last_event_seq
+    last_event_seq: params.initialLastEventSeq != null ? params.initialLastEventSeq + 1 : 0,
     last_event_id: null,
     last_event_type: RUNTIME_SESSION_EVENT_TYPES.SESSION_CREATED,
 
@@ -201,7 +202,7 @@ export function createRuntimeSession(params) {
     blocked_reason: null,
 
     // Retry/recovery
-    retry_count: 0,
+    retry_count: params.initialRetryCount ?? 0,
     max_retries: params.maxRetries ?? 2,
     last_recovery_at: null,
 
@@ -215,14 +216,16 @@ export function createRuntimeSession(params) {
     terminal_artifact_hash: null,
 
     // Event log (in-memory; flushed to append-only-event-store)
+    // R2B: On recovery, start seq after the previous session's last_event_seq for monotonic cursor
     _events: [buildSessionEvent({
       sessionId,
-      seq: 0,
+      seq: params.initialLastEventSeq != null ? params.initialLastEventSeq + 1 : 0,
       type: RUNTIME_SESSION_EVENT_TYPES.SESSION_CREATED,
       payload: {
         task_id: params.taskId,
         created_by_runtime_id: params.createdByRuntimeId,
         workspace_dir: params.workspaceDir ?? null,
+        recovered_from_seq: params.initialLastEventSeq ? params.initialLastEventSeq - 1 : undefined,
       },
       now,
     })],

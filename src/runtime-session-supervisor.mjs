@@ -25,6 +25,12 @@
  *   append-only event store via RuntimeSessionEventBridge. Local events.json
  *   is a bounded projection/cache only.
  *
+ * R2C REPAIR: Plain/non-JSON stdout lines from the child process MUST NOT
+ *   manufacture liveness. Only structured RuntimeSession events (JSON lines
+ *   with type starting "runtime_session.") are valid heartbeat sources and
+ *   may reset the heartbeat timeout. Plain logs are observed but do NOT
+ *   reset the structured-event heartbeat timeout.
+ *
  * LAWS enforced:
  *   LAW-2: Supervisor owns child-process lifecycle; caller does not.
  *   LAW-3: RuntimeSession must survive API/CLI client exit.
@@ -125,6 +131,9 @@ export function launchSession(params) {
     workspaceDir: params.workspaceDir ?? null,
     maxRetries: config.max_retries,
     existingSessionId: params.existingSessionId ?? null,  // R1B
+    initialRetryCount: params.initialRetryCount ?? 0,     // R2B: carry retry count on recovery
+    initialCheckpointRef: params.initialCheckpointRef ?? null,  // R2B: carry checkpoint on recovery
+    initialLastEventSeq: params.initialLastEventSeq ?? 0,  // R2B: carry last_event_seq on recovery
   });
 
   // 2. Build initial snapshot (before process spawns)
@@ -204,18 +213,24 @@ export function launchSession(params) {
       // Parse structured event (supervisor protocol)
       const parsed = tryParseRuntimeEvent(trimmed);
       if (parsed) {
+        // R2C FIX: ONLY structured events may reset the heartbeat timeout and manufacture liveness.
+        // Plain/non-JSON stdout lines are observed but cannot manufacture a RuntimeSession heartbeat
+        // or reset the structured-event timeout. LAW-4: heartbeat comes from runtime events only.
         session = applyRuntimeEvent(session, parsed);
+        resetTimeout(); // R2C: ONLY here — structured events only
+        persistSession(session, config, params.onSnapshot).catch(noop);
+        params.onEvent?.(lastEvent(session));
       } else {
-        // Plain line → treat as progress note heartbeat (LAW-4: from events only)
-        session = recordHeartbeat(session, {
-          phase: session.current_phase,
-          progressNote: trimmed.slice(0, 256), // bounded — DOC-031 no raw CoT
-        });
+        // R2C: plain log line — record in plain_log_lines list (bounded) but DO NOT
+        // reset the heartbeat timeout and DO NOT call recordHeartbeat().
+        // Plain stdout cannot manufacture liveness.
+        if (!TERMINAL_RUNTIME_STATES.has(session.runtime_state)) {
+          session = { ...session, _plain_log_count: (session._plain_log_count ?? 0) + 1 };
+          // persist observation only — no timeout reset, no heartbeat event
+          persistSession(session, config, params.onSnapshot).catch(noop);
+        }
+        // Do NOT call params.onEvent — plain logs are not session events
       }
-
-      resetTimeout();
-      persistSession(session, config, params.onSnapshot).catch(noop);
-      params.onEvent?.(lastEvent(session));
     }
   });
 
@@ -279,6 +294,9 @@ export function launchSession(params) {
           ...params,
           args: recoveryArgs,
           existingSessionId: session.session_id,  // R1B FIX: preserve same session_id
+          initialRetryCount: session.retry_count,  // R2B FIX: carry retry_count into recovered session
+          initialCheckpointRef: session.checkpoint_ref,  // R2B FIX: carry checkpoint into recovered session
+          initialLastEventSeq: session.last_event_seq,  // R2B FIX: carry last_event_seq for monotonic cursor
           _adapter: adapter,                       // reuse same adapter
           config,
         });
@@ -641,6 +659,60 @@ export function proveProcessExitNotTaskCompletion() {
     // R1C proof: task_state MUST NOT be TASK_COMPLETED
     process_exit_equals_task_completion: session.task_state === "TASK_COMPLETED",
     law_7_satisfied: session.task_state !== "TASK_COMPLETED",
+  };
+}
+
+// ─── Client-B reconnect from disk (R2A) ───────────────────────────────────
+
+/**
+ * reconnectFromDisk — R2A Client-B reconnect path.
+ *
+ * Called by a DIFFERENT OS process (client-B) after client-A has exited.
+ * Reads the session snapshot and events from disk, computes missed events
+ * since cursorSeq, and returns the full reconciliation window.
+ *
+ * This is the real separate-process reconnect path. It does NOT require
+ * an in-memory handle — it works purely from persistent disk state.
+ *
+ * @param {string} sessionId         - Session to reconnect to
+ * @param {number} cursorSeq         - Last event seq client-A saw
+ * @param {string} [outDir]          - Session out dir (default: DEFAULT_RUNTIME_SESSION_OUT_DIR)
+ * @returns {object} { snapshot, missed_events, events_total, cursor_seq, reconnected_at }
+ */
+export async function reconnectFromDisk(sessionId, cursorSeq, { outDir } = {}) {
+  const dir = path.resolve(outDir ?? DEFAULT_RUNTIME_SESSION_OUT_DIR, sessionId);
+
+  // Read snapshot
+  let snapshot;
+  try {
+    const raw = await readFile(path.join(dir, "snapshot.json"), "utf8");
+    snapshot = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`reconnectFromDisk: cannot read snapshot for ${sessionId}: ${e.message}`);
+  }
+
+  // Read events (projection cache — used for cursor reconciliation)
+  let events = [];
+  try {
+    const raw = await readFile(path.join(dir, "events.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    // events.json is written as {schema_version, session_id, events: [...]}
+    events = parsed.events ?? (Array.isArray(parsed) ? parsed : []);
+  } catch {
+    events = [];
+  }
+
+  // Compute missed events since cursorSeq
+  const missed_events = events.filter(e => (e.seq ?? -1) > cursorSeq);
+
+  return {
+    snapshot,
+    missed_events,
+    events_total: events.length,
+    cursor_seq: cursorSeq,
+    reconnected_at: new Date().toISOString(),
+    session_id: sessionId,
+    runtime_state: snapshot.runtime_state,
   };
 }
 
