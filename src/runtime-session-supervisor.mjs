@@ -862,9 +862,14 @@ async function persistSession(session, config, onSnapshot) {
   // R4A: append to canonical event store JSONL (R4 per-session buffer — kept for audit trail)
   appendToCanonicalEventStore(session, {}).catch(noop);
 
-  // R5A: append to EXISTING append-only-event-store.mjs authority path using
+  // R5A / R7A: append to EXISTING append-only-event-store.mjs authority path using
   //      buildStoredEvent() + hashObject() — same schema as batch pipeline.
   //      artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+  //
+  //      R7A: we NOW AWAIT this call so we get the actual stored_event_id values
+  //      produced by buildStoredEvent() from the writeResult.stored_event_bindings field.
+  //      These real IDs are then fed into WorkflowRun/AgentRun ledger reflection,
+  //      replacing the previous synthetic `runtime-session.<id>.seq.<N>` substitutes.
   const envelopes = session._events.map(e => toCloudEventEnvelope(e, session));
   const correlations = {
     session_id: session.session_id,
@@ -873,9 +878,21 @@ async function persistSession(session, config, onSnapshot) {
     task_run_id: session.task_run_id ?? null,
     task_id: session.task_id,
   };
-  appendRuntimeSessionStoredEvents(envelopes, correlations, {
-    ...(config.canonical_store_root ? { storeRoot: config.canonical_store_root } : {}),
-  }).catch(noop);
+
+  // R7A: await to obtain real stored_event_bindings (actual stored_event_id values)
+  let r5aResult = null;
+  try {
+    r5aResult = await appendRuntimeSessionStoredEvents(envelopes, correlations, {
+      ...(config.canonical_store_root ? { storeRoot: config.canonical_store_root } : {}),
+    });
+  } catch (_) { /* non-fatal; proceed with empty bindings */ }
+
+  // R7A: use actual stored_event_id values from append-only authority, not synthetic IDs.
+  // If r5aResult is null (write failed) fall back to empty array so WF/AR still get
+  // the event_envelope_id bindings from the envelopes array.
+  const storedEventBindings = (r5aResult?.stored_event_bindings?.length > 0)
+    ? r5aResult.stored_event_bindings
+    : envelopes.map(e => ({ stored_event_id: null, event_envelope_id: e.id }));
 
   // R6A: append to EXISTING event-envelope-ledger.mjs authority path using
   //      buildEnvelope() logic — same EVENT_ENVELOPE_SCHEMA_VERSION as batch pipeline.
@@ -884,9 +901,9 @@ async function persistSession(session, config, onSnapshot) {
     ...(config.event_envelope_ledger_root ? { ledgerRoot: config.event_envelope_ledger_root } : {}),
   }).catch(noop);
 
-  // R6B: reflect correlations through EXISTING workflow-run-ledger.mjs authority.
+  // R6B / R7A: reflect correlations through EXISTING workflow-run-ledger.mjs authority.
   //      artifacts/workflow-run-ledger/runtime-sessions/<session_id>/workflow-run-record.jsonl
-  const snapshot = buildSessionSnapshot(session);
+  //      Now uses real stored_event_id values from R7A storedEventBindings (not synthetic IDs).
   appendRuntimeSessionWorkflowRunRecord(
     {
       session_id: session.session_id,
@@ -897,17 +914,15 @@ async function persistSession(session, config, onSnapshot) {
       runtime_state: session.runtime_state,
       task_state: session.task_state,
     },
-    envelopes.map((e, i) => ({
-      stored_event_id: `runtime-session.${session.session_id}.seq.${i + 1}`,
-      event_envelope_id: e.id,
-    })),
+    storedEventBindings,
     {
       ...(config.workflow_run_ledger_root ? { ledgerRoot: config.workflow_run_ledger_root } : {}),
     }
   ).catch(noop);
 
-  // R6B: reflect correlations through EXISTING agent-run-ledger.mjs authority.
+  // R6B / R7A: reflect correlations through EXISTING agent-run-ledger.mjs authority.
   //      artifacts/agent-run-ledger/runtime-sessions/<session_id>/agent-run-record.jsonl
+  //      Now uses real stored_event_id values from R7A storedEventBindings (not synthetic IDs).
   appendRuntimeSessionAgentRunRecord(
     {
       session_id: session.session_id,
@@ -918,10 +933,7 @@ async function persistSession(session, config, onSnapshot) {
       runtime_state: session.runtime_state,
       task_state: session.task_state,
     },
-    envelopes.map((e, i) => ({
-      stored_event_id: `runtime-session.${session.session_id}.seq.${i + 1}`,
-      event_envelope_id: e.id,
-    })),
+    storedEventBindings,
     {
       ...(config.agent_run_ledger_root ? { ledgerRoot: config.agent_run_ledger_root } : {}),
     }

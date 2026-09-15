@@ -688,6 +688,14 @@ export async function appendRuntimeSessionStoredEvents(envelopes, correlations, 
     newStoredEvents.push(storedEvent);
   }
 
+  // R7A: build storedEventBindings BEFORE the write result, so the actual stored_event_id +
+  //      event_envelope_id pairs produced by buildStoredEvent() can be returned in writeResult
+  //      and consumed by WorkflowRun/AgentRun ledger reflection without synthetic substitutes.
+  const storedEventBindings = newStoredEvents.map(se => ({
+    stored_event_id: se.stored_event_id,
+    event_envelope_id: se.event_envelope_id,
+  }));
+
   const writeResult = {
     schema_version: RUNTIME_SESSION_STORE_SCHEMA_VERSION,
     written_at: runAt,
@@ -708,6 +716,10 @@ export async function appendRuntimeSessionStoredEvents(envelopes, correlations, 
     immutable_append: true,
     hash_chained: true,
     correlation_refs: { session_id, agent_run_id, workflow_run_id, task_run_id, task_id },
+    // R7A: actual stored_event_id values produced by buildStoredEvent() — not synthetic substitutes.
+    // These are the real IDs written to the append-only-event-store authority path.
+    // Consumers (WorkflowRun/AgentRun ledgers) MUST use these, never synthetic replacements.
+    stored_event_bindings: storedEventBindings,
   };
 
   if (!dryRun && newStoredEvents.length > 0) {
