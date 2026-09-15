@@ -444,17 +444,22 @@ test("M1: HermesNativeSessionAdapter passes contract validation", () => {
 
 test("M2: adapter contract freeze includes all registered adapters", () => {
   const freeze = buildAdapterContractFreeze();
-  assert.equal(freeze.schema_version, "native-session-adapter-contract.v1");
+  // R3A: schema version updated to v2 (native session id support)
+  assert.equal(freeze.schema_version, "native-session-adapter-contract.v2");
   assert.ok(freeze.adapter_count >= 1);
   for (const adapter of freeze.adapters) {
     assert.equal(adapter.contract_valid, true, `Adapter ${adapter.runtime_id} contract invalid`);
   }
 });
 
-test("M3: getAdapter returns correct instance", () => {
+test("M3: getAdapter returns correct instance — R3A: resumable=true (hermes --resume SESSION verified)", () => {
   const adapter = getAdapter("hermes");
   assert.equal(adapter.runtime_id, "hermes");
-  assert.equal(adapter.resumable, false);
+  // R3A REPAIR: resumable=true — hermes CLI exposes `--resume SESSION` (verified via hermes --help)
+  // Prior R2 incorrectly set resumable=false; this was a known stale assertion
+  assert.equal(adapter.resumable, true, "R3A: HermesNativeSessionAdapter.resumable must be true — hermes --resume SESSION is a real CLI flag");
+  // R3A: nativeSessionIdFormat must be present
+  assert.ok(adapter.nativeSessionIdFormat instanceof RegExp, "R3A: nativeSessionIdFormat must be a RegExp");
 });
 
 test("M4: getAdapter throws for unknown runtime_id", () => {
