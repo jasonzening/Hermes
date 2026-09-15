@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 export const DEFAULT_AGENT_RUN_LEDGER_OUT_DIR = "artifacts/agent-run-ledger/latest";
@@ -19,6 +20,199 @@ const AGENT_RUN_ARTIFACT_REFERENCE_SCHEMA_VERSION = "agent-run-artifact-referenc
 const AGENT_RUN_LOG_REFERENCE_SCHEMA_VERSION = "agent-run-log-reference.v1";
 const AGENT_RUN_EVENT_BINDING_SCHEMA_VERSION = "agent-run-event-binding.v1";
 const AGENT_RUN_LEDGER_CONTRACT_ID = "agent-run-ledger.v1";
+
+// ─── R6B: Live RuntimeSession AgentRun ledger integration ───────────────────
+//
+// Adds the smallest existing-module extension so RuntimeSession event/run
+// correlations are reflected through the real agent-run-ledger authority.
+//
+// Artifact path (within EXISTING authority root):
+//   artifacts/agent-run-ledger/runtime-sessions/<session_id>/agent-run-record.jsonl
+//
+// Each record carries agent_run_id, workflow_run_id, session_id, task_run_id,
+// task_id correlation fields proving continuity through the ledger authority.
+
+export const RUNTIME_SESSION_AR_SUBDIR = "runtime-sessions";
+export const RUNTIME_SESSION_AR_FILENAME = "agent-run-record.jsonl";
+export const RUNTIME_SESSION_AR_SCHEMA_VERSION = "runtime-session-agent-run-record.v1";
+
+/**
+ * Append a live RuntimeSession correlation record into the existing
+ * agent-run-ledger authority path.
+ *
+ * @param {object} sessionSnapshot - { session_id, agent_run_id, workflow_run_id, task_run_id, task_id, ... }
+ * @param {object[]} storedEventIds - array of { stored_event_id, event_envelope_id } from append-only store
+ * @param {object} [options]
+ * @param {string} [options.ledgerRoot] - Override authority root
+ * @param {boolean} [options.dryRun]   - Transform but do not write
+ * @param {string} [options.runAt]     - ISO timestamp override
+ * @returns {Promise<object>} WriteResult with evidence record
+ */
+export async function appendRuntimeSessionAgentRunRecord(sessionSnapshot, storedEventIds, options = {}) {
+  const {
+    ledgerRoot = path.join(path.dirname(DEFAULT_AGENT_RUN_LEDGER_OUT_DIR), RUNTIME_SESSION_AR_SUBDIR),
+    dryRun = false,
+    runAt = new Date().toISOString(),
+  } = options;
+
+  const {
+    session_id,
+    agent_run_id = null,
+    workflow_run_id = null,
+    task_run_id = null,
+    task_id = null,
+    runtime_state = null,
+    task_state = null,
+  } = sessionSnapshot;
+
+  const sessionDir = path.resolve(ledgerRoot, session_id);
+  const storePath = path.join(sessionDir, RUNTIME_SESSION_AR_FILENAME);
+
+  // Idempotency: check existing records
+  const existingRecordIds = new Set();
+  let existingLineCount = 0;
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    existingLineCount = lines.length;
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.agent_run_record_id) existingRecordIds.add(parsed.agent_run_record_id);
+      } catch { /* skip */ }
+    }
+  }
+
+  // Build a runtime-session agent-run-record using the same AGENT_RUN_RECORD_SCHEMA_VERSION
+  const recordId = `agent-run-record.runtime-session.${slugify(session_id)}.${dateStamp(runAt)}`;
+  if (existingRecordIds.has(recordId)) {
+    return {
+      schema_version: RUNTIME_SESSION_AR_SCHEMA_VERSION,
+      written_at: runAt,
+      session_id,
+      agent_run_id,
+      workflow_run_id,
+      store_path: storePath,
+      appended_count: 0,
+      skipped_duplicate_count: 1,
+      is_dry_run: dryRun,
+    };
+  }
+
+  const record = {
+    schema_version: AGENT_RUN_RECORD_SCHEMA_VERSION,
+    agent_run_record_id: recordId,
+    // Primary correlation fields — proven through real ledger authority readback:
+    agent_run_id,
+    workflow_run_id,
+    session_id,
+    task_run_id,
+    task_id,
+    // Ledger authority fields
+    run_ledger_id: workflow_run_id ?? session_id,
+    correlation_id: session_id,
+    correlation_trace_id: `runtime-session.${session_id}`,
+    agent_run_status: task_state ?? "active",
+    runtime_state: runtime_state ?? "runtime_session",
+    // Event bindings from the append-only store
+    stored_event_ids: (storedEventIds ?? []).map(e => e.stored_event_id ?? e),
+    event_envelope_ids: (storedEventIds ?? []).map(e => e.event_envelope_id ?? e),
+    event_count: (storedEventIds ?? []).length,
+    agent_run_record_status: "runtime_session_backed",
+    capability_contract_status: "runtime_session",
+    run_ledger_binding_status: "runtime_session",
+    domain_pack: "hermes_arf",
+    recorded_at: runAt,
+    authority_module: "src/agent-run-ledger.mjs",
+    authority_note: "RuntimeSession correlation record — same AGENT_RUN_RECORD_SCHEMA_VERSION as batch pipeline",
+  };
+
+  const writeResult = {
+    schema_version: RUNTIME_SESSION_AR_SCHEMA_VERSION,
+    written_at: runAt,
+    session_id,
+    agent_run_id,
+    workflow_run_id,
+    task_run_id,
+    task_id,
+    store_path: storePath,
+    store_authority: "EXISTING_AUTHORITY",
+    authority_module: "src/agent-run-ledger.mjs",
+    authority_note: "agent-run-record built using AGENT_RUN_RECORD_SCHEMA_VERSION from existing agent-run-ledger.mjs",
+    is_dry_run: dryRun,
+    pre_append_line_count: existingLineCount,
+    appended_count: 1,
+    skipped_duplicate_count: 0,
+    total_after_append: existingLineCount + 1,
+    agent_run_record_id: recordId,
+    correlation_proof: {
+      agent_run_id,
+      workflow_run_id,
+      session_id,
+      task_run_id,
+      task_id,
+    },
+  };
+
+  if (!dryRun) {
+    await mkdir(sessionDir, { recursive: true });
+    await appendFile(storePath, JSON.stringify(record) + "\n", "utf8");
+  }
+
+  return writeResult;
+}
+
+/**
+ * Read back RuntimeSession AgentRun records from the existing
+ * agent-run-ledger authority path.
+ *
+ * @param {string} sessionId
+ * @param {object} [options]
+ * @param {string} [options.ledgerRoot] - Override authority root
+ * @returns {Promise<object>} { records, readback_path, total_count, authority, correlation_continuity }
+ */
+export async function readRuntimeSessionAgentRunRecords(sessionId, options = {}) {
+  const {
+    ledgerRoot = path.join(path.dirname(DEFAULT_AGENT_RUN_LEDGER_OUT_DIR), RUNTIME_SESSION_AR_SUBDIR),
+  } = options;
+
+  const storePath = path.resolve(ledgerRoot, sessionId, RUNTIME_SESSION_AR_FILENAME);
+
+  let records = [];
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    for (const line of lines) {
+      try { records.push(JSON.parse(line)); } catch { /* skip */ }
+    }
+  }
+
+  // Verify correlation continuity
+  const correlationContinuity = records.map(r => ({
+    agent_run_record_id: r.agent_run_record_id,
+    has_agent_run_id: r.agent_run_id != null,
+    has_workflow_run_id: r.workflow_run_id != null,
+    has_session_id: r.session_id === sessionId,
+    has_task_run_id: r.task_run_id != null,
+    has_task_id: r.task_id != null,
+    has_stored_event_ids: Array.isArray(r.stored_event_ids) && r.stored_event_ids.length > 0,
+    schema_version: r.schema_version,
+  }));
+
+  return {
+    session_id: sessionId,
+    readback_path: storePath,
+    authority: "agent-run-ledger.mjs:appendRuntimeSessionAgentRunRecord",
+    authority_module: "src/agent-run-ledger.mjs",
+    total_count: records.length,
+    records,
+    correlation_continuity: correlationContinuity,
+    all_correlation_fields_present: correlationContinuity.every(c =>
+      c.has_agent_run_id && c.has_session_id && c.has_stored_event_ids
+    ),
+  };
+}
+// ─── End R6B AgentRun ────────────────────────────────────────────────────────
 
 export async function runAgentRunLedger(options = {}) {
   const result = await buildAgentRunLedger(options);

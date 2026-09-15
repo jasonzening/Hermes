@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 export const DEFAULT_EVENT_ENVELOPE_LEDGER_OUT_DIR = "artifacts/event-envelope-ledger/latest";
@@ -16,6 +17,207 @@ const EVENT_ENVELOPE_CONTRACT_ID = "event-envelope.v1";
 const CLOUDEVENTS_SPEC_VERSION = "1.0";
 const DATA_CONTENT_TYPE = "application/json";
 const REQUIRED_ENVELOPE_FIELDS = ["id", "specversion", "type", "source", "time", "dataschema", "datacontenttype", "data"];
+
+// ─── R6A: Live RuntimeSession event-envelope authority integration ──────────
+//
+// These functions add the smallest extension inside the existing
+// event-envelope-ledger authority so a live RuntimeSession CloudEvent from
+// supervisor persistence is represented in the existing event-envelope
+// authority output/path and can be read back from it.
+//
+// Artifact path (within EXISTING authority root, not a parallel store):
+//   artifacts/event-envelope-ledger/runtime-sessions/<session_id>/event-envelopes.jsonl
+//
+// Each record uses the same buildEnvelope() logic as the batch pipeline.
+// Idempotent: existing envelope IDs are skipped on re-append.
+
+export const RUNTIME_SESSION_ENVELOPE_SUBDIR = "runtime-sessions";
+export const RUNTIME_SESSION_ENVELOPE_FILENAME = "event-envelopes.jsonl";
+export const RUNTIME_SESSION_ENVELOPE_SCHEMA_VERSION = "runtime-session-envelope-store.v1";
+
+/**
+ * Append live RuntimeSession CloudEvent envelopes into the existing
+ * event-envelope-ledger authority path.
+ *
+ * @param {object[]} cloudEventEnvelopes  - CloudEvent objects (from toCloudEventEnvelope())
+ * @param {object}   correlations         - { session_id, agent_run_id, workflow_run_id, task_run_id, task_id }
+ * @param {object}   [options]
+ * @param {string}   [options.ledgerRoot] - Override authority root
+ * @param {boolean}  [options.dryRun]     - Transform but do not write
+ * @param {string}   [options.runAt]      - ISO timestamp override
+ * @returns {Promise<object>} WriteResult with evidence record
+ */
+export async function appendRuntimeSessionEventEnvelopes(cloudEventEnvelopes, correlations, options = {}) {
+  const {
+    ledgerRoot = path.join(path.dirname(DEFAULT_EVENT_ENVELOPE_LEDGER_OUT_DIR), RUNTIME_SESSION_ENVELOPE_SUBDIR),
+    dryRun = false,
+    runAt = new Date().toISOString(),
+  } = options;
+
+  const { session_id, agent_run_id = null, workflow_run_id = null, task_run_id = null, task_id = null } = correlations;
+
+  const sessionDir = path.resolve(ledgerRoot, session_id);
+  const storePath = path.join(sessionDir, RUNTIME_SESSION_ENVELOPE_FILENAME);
+
+  // Read existing IDs for idempotency
+  const existingIds = new Set();
+  let existingLineCount = 0;
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    existingLineCount = lines.length;
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.id) existingIds.add(parsed.id);
+      } catch { /* skip malformed */ }
+    }
+  }
+
+  // Build envelope records using existing buildEnvelope() logic
+  const newEnvelopes = [];
+  for (const cloudEvent of cloudEventEnvelopes) {
+    if (existingIds.has(cloudEvent.id)) continue; // idempotent skip
+
+    // Use existing buildEnvelope() via runtimeSessionEnvelope() which adapts
+    // the CloudEvent into the buildEnvelope() parameter contract
+    const envelope = runtimeSessionEnvelope(cloudEvent, {
+      session_id,
+      agent_run_id,
+      workflow_run_id,
+      task_run_id,
+      task_id,
+      generatedAt: runAt,
+    });
+
+    newEnvelopes.push(envelope);
+  }
+
+  const writeResult = {
+    schema_version: RUNTIME_SESSION_ENVELOPE_SCHEMA_VERSION,
+    written_at: runAt,
+    session_id,
+    agent_run_id,
+    workflow_run_id,
+    task_run_id,
+    task_id,
+    store_path: storePath,
+    store_authority: "EXISTING_AUTHORITY",
+    authority_module: "src/event-envelope-ledger.mjs",
+    authority_note: "envelope records built by runtimeSessionEnvelope() using existing buildEnvelope() logic — same EVENT_ENVELOPE_SCHEMA_VERSION as batch pipeline",
+    is_dry_run: dryRun,
+    pre_append_line_count: existingLineCount,
+    appended_count: newEnvelopes.length,
+    skipped_duplicate_count: cloudEventEnvelopes.length - newEnvelopes.length,
+    total_after_append: existingLineCount + newEnvelopes.length,
+    immutable_append: true,
+    envelope_schema_version: EVENT_ENVELOPE_SCHEMA_VERSION,
+    cloudevents_spec_version: CLOUDEVENTS_SPEC_VERSION,
+    correlation_refs: { session_id, agent_run_id, workflow_run_id, task_run_id, task_id },
+  };
+
+  if (!dryRun && newEnvelopes.length > 0) {
+    await mkdir(sessionDir, { recursive: true });
+    const lines = newEnvelopes.map(e => JSON.stringify(e)).join("\n") + "\n";
+    await appendFile(storePath, lines, "utf8");
+  }
+
+  return writeResult;
+}
+
+/**
+ * Read back RuntimeSession event envelopes from the existing
+ * event-envelope-ledger authority path for a given session.
+ *
+ * @param {string} sessionId
+ * @param {object} [options]
+ * @param {string} [options.ledgerRoot] - Override authority root
+ * @returns {Promise<object>} { envelopes, readback_path, total_count, authority }
+ */
+export async function readRuntimeSessionEventEnvelopes(sessionId, options = {}) {
+  const {
+    ledgerRoot = path.join(path.dirname(DEFAULT_EVENT_ENVELOPE_LEDGER_OUT_DIR), RUNTIME_SESSION_ENVELOPE_SUBDIR),
+  } = options;
+
+  const storePath = path.resolve(ledgerRoot, sessionId, RUNTIME_SESSION_ENVELOPE_FILENAME);
+
+  let envelopes = [];
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    for (const line of lines) {
+      try { envelopes.push(JSON.parse(line)); } catch { /* skip */ }
+    }
+  }
+
+  // Verify required fields are present in all envelopes
+  const allRequiredFieldsPresent = envelopes.every(e =>
+    REQUIRED_ENVELOPE_FIELDS.every(f => e[f] !== undefined && e[f] !== null && e[f] !== "")
+  );
+
+  return {
+    session_id: sessionId,
+    readback_path: storePath,
+    authority: "event-envelope-ledger.mjs:appendRuntimeSessionEventEnvelopes",
+    authority_module: "src/event-envelope-ledger.mjs",
+    envelope_schema_version: EVENT_ENVELOPE_SCHEMA_VERSION,
+    total_count: envelopes.length,
+    envelopes,
+    all_required_fields_present: allRequiredFieldsPresent,
+    required_fields: REQUIRED_ENVELOPE_FIELDS,
+  };
+}
+
+/**
+ * Adapt a live RuntimeSession CloudEvent into the existing buildEnvelope()
+ * parameter contract so envelope records have the same schema as the
+ * batch pipeline output.
+ */
+function runtimeSessionEnvelope(cloudEvent, { session_id, agent_run_id, workflow_run_id, task_run_id, task_id, generatedAt }) {
+  // Synthesize a source event compatible with buildEnvelope's `event` param
+  const sourceEvent = {
+    ...cloudEvent.data,
+    correlation_id: cloudEvent.correlationid ?? cloudEvent.extensions?.correlationid ?? session_id,
+    causation_id: cloudEvent.causationid ?? null,
+    tenant_id: cloudEvent.tenantid ?? null,
+    matter_id: cloudEvent.matterid ?? null,
+    workflow_run_id: cloudEvent.workflowrunid ?? workflow_run_id ?? null,
+    run_ledger_id: cloudEvent.runledgerid ?? null,
+    policy_snapshot_id: cloudEvent.policysnapshotid ?? null,
+    actor_type: cloudEvent.actortype ?? "runtime_session",
+    actor_id: cloudEvent.actorid ?? session_id,
+    source_id: cloudEvent.source ?? "runtime-session-supervisor",
+    protected_action_event: false,
+    protected_action_executed: false,
+    // Carry runtime session correlation in envelope extensions
+    session_id,
+    agent_run_id,
+    task_run_id,
+    task_id,
+  };
+
+  return buildEnvelope({
+    id: cloudEvent.id,
+    type: cloudEvent.type ?? "runtime_session.event",
+    sourceId: cloudEvent.source ?? `urn:hermes:runtime-session:${session_id}`,
+    subject: cloudEvent.subject ?? session_id,
+    time: cloudEvent.time ?? generatedAt,
+    sourceKind: "runtime_session_event",
+    sourceEventId: cloudEvent.id,
+    sourceSchemaVersion: cloudEvent.schemaversion ?? cloudEvent.extensions?.schemaversion ?? null,
+    schemaVersion: cloudEvent.schemaversion ?? "runtime-session-event.v1",
+    data: isPlainObject(cloudEvent.data) ? cloudEvent.data : { raw: cloudEvent.data },
+    metadata: {
+      session_id,
+      agent_run_id: agent_run_id ?? null,
+      workflow_run_id: workflow_run_id ?? null,
+      task_run_id: task_run_id ?? null,
+      task_id: task_id ?? null,
+    },
+    event: sourceEvent,
+  });
+}
+// ─── End R6A ────────────────────────────────────────────────────────────────
 
 export async function runEventEnvelopeLedger(options = {}) {
   const result = await buildEventEnvelopeLedger(options);

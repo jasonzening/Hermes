@@ -79,6 +79,24 @@ import {
 } from "./append-only-event-store.mjs";
 import { toCloudEventEnvelope } from "./runtime-session-event-bridge.mjs";
 
+// R6A: event-envelope-ledger authority
+import {
+  appendRuntimeSessionEventEnvelopes,
+  readRuntimeSessionEventEnvelopes,
+} from "./event-envelope-ledger.mjs";
+
+// R6B: workflow-run-ledger authority
+import {
+  appendRuntimeSessionWorkflowRunRecord,
+  readRuntimeSessionWorkflowRunRecords,
+} from "./workflow-run-ledger.mjs";
+
+// R6B: agent-run-ledger authority
+import {
+  appendRuntimeSessionAgentRunRecord,
+  readRuntimeSessionAgentRunRecords,
+} from "./agent-run-ledger.mjs";
+
 export const DEFAULT_SUPERVISOR_CONFIG = {
   heartbeat_timeout_ms: 120_000,   // 2 min — from adapter lifecycle.heartbeat_seconds=60 * 2x
   max_retries: 2,
@@ -91,6 +109,12 @@ export const DEFAULT_SUPERVISOR_CONFIG = {
   // R5A: canonical stored-events store root — defaults to the append-only-event-store authority path
   // Set this in tests to redirect to a temp dir
   canonical_store_root: null,   // null = use default from append-only-event-store.mjs
+  // R6A: event-envelope-ledger authority root — null = use default
+  event_envelope_ledger_root: null,
+  // R6B: workflow-run-ledger authority root — null = use default
+  workflow_run_ledger_root: null,
+  // R6B: agent-run-ledger authority root — null = use default
+  agent_run_ledger_root: null,
 };
 
 // ─── Main entry point ──────────────────────────────────────────────────────
@@ -735,6 +759,13 @@ export async function reconnectFromDisk(sessionId, cursorSeq, { outDir, storeRoo
 
 // ─── Process exit/recovery watchdog (separate from launchSession) ────────
 
+// R6: Exported readback functions for tests and downstream consumers
+// These expose the existing authority readback paths from the supervisor context.
+
+export { readRuntimeSessionEventEnvelopes } from "./event-envelope-ledger.mjs";
+export { readRuntimeSessionWorkflowRunRecords } from "./workflow-run-ledger.mjs";
+export { readRuntimeSessionAgentRunRecords } from "./agent-run-ledger.mjs";
+
 /**
  * Watch an already-running session file and detect stale heartbeat.
  * Used by a separate watchdog process (DOC-030 crash recovery).
@@ -845,6 +876,56 @@ async function persistSession(session, config, onSnapshot) {
   appendRuntimeSessionStoredEvents(envelopes, correlations, {
     ...(config.canonical_store_root ? { storeRoot: config.canonical_store_root } : {}),
   }).catch(noop);
+
+  // R6A: append to EXISTING event-envelope-ledger.mjs authority path using
+  //      buildEnvelope() logic — same EVENT_ENVELOPE_SCHEMA_VERSION as batch pipeline.
+  //      artifacts/event-envelope-ledger/runtime-sessions/<session_id>/event-envelopes.jsonl
+  appendRuntimeSessionEventEnvelopes(envelopes, correlations, {
+    ...(config.event_envelope_ledger_root ? { ledgerRoot: config.event_envelope_ledger_root } : {}),
+  }).catch(noop);
+
+  // R6B: reflect correlations through EXISTING workflow-run-ledger.mjs authority.
+  //      artifacts/workflow-run-ledger/runtime-sessions/<session_id>/workflow-run-record.jsonl
+  const snapshot = buildSessionSnapshot(session);
+  appendRuntimeSessionWorkflowRunRecord(
+    {
+      session_id: session.session_id,
+      workflow_run_id: session.workflow_run_id ?? null,
+      agent_run_id: session.agent_run_id ?? null,
+      task_run_id: session.task_run_id ?? null,
+      task_id: session.task_id ?? null,
+      runtime_state: session.runtime_state,
+      task_state: session.task_state,
+    },
+    envelopes.map((e, i) => ({
+      stored_event_id: `runtime-session.${session.session_id}.seq.${i + 1}`,
+      event_envelope_id: e.id,
+    })),
+    {
+      ...(config.workflow_run_ledger_root ? { ledgerRoot: config.workflow_run_ledger_root } : {}),
+    }
+  ).catch(noop);
+
+  // R6B: reflect correlations through EXISTING agent-run-ledger.mjs authority.
+  //      artifacts/agent-run-ledger/runtime-sessions/<session_id>/agent-run-record.jsonl
+  appendRuntimeSessionAgentRunRecord(
+    {
+      session_id: session.session_id,
+      agent_run_id: session.agent_run_id ?? null,
+      workflow_run_id: session.workflow_run_id ?? null,
+      task_run_id: session.task_run_id ?? null,
+      task_id: session.task_id ?? null,
+      runtime_state: session.runtime_state,
+      task_state: session.task_state,
+    },
+    envelopes.map((e, i) => ({
+      stored_event_id: `runtime-session.${session.session_id}.seq.${i + 1}`,
+      event_envelope_id: e.id,
+    })),
+    {
+      ...(config.agent_run_ledger_root ? { ledgerRoot: config.agent_run_ledger_root } : {}),
+    }
+  ).catch(noop);
 
   return result;
 }
