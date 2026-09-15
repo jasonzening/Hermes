@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, appendFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 export const DEFAULT_APPEND_ONLY_EVENT_STORE_OUT_DIR = "artifacts/append-only-event-store/latest";
@@ -584,6 +585,198 @@ function slugify(value) {
 
 function dateStamp(isoString) {
   return isoString.replaceAll(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+// ─── R5A: Live runtime-session append path ──────────────────────────────────
+//
+// Canonical runtime-session stored-events live under the EXISTING artifact root:
+//   artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+//
+// Each line is a stored-event object built with the same buildStoredEvent() +
+// hashObject() logic as the batch pipeline.  The per-session file is append-only
+// and idempotent on re-ingest (de-duplicated by event_envelope_id).
+//
+// This is the ONLY place in the codebase that calls buildStoredEvent() for live
+// RuntimeSession events — no parallel authority is created.
+
+export const RUNTIME_SESSION_STORE_SUBDIR = "runtime-sessions";
+export const RUNTIME_SESSION_STORED_EVENTS_FILENAME = "stored-events.jsonl";
+export const RUNTIME_SESSION_STORE_SCHEMA_VERSION = "append-only-event-store-runtime-session.v1";
+
+/**
+ * Append RuntimeSession CloudEvent envelopes into the existing
+ * append-only-event-store artifact hierarchy as proper stored-event records.
+ *
+ * Artifact path (within existing authority root):
+ *   artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+ *
+ * Each stored-event is built by the same buildStoredEvent() + hashObject() logic
+ * used by the batch pipeline, ensuring format/schema identity.
+ *
+ * Idempotent: existing event_envelope_id values are skipped on re-ingest.
+ *
+ * @param {object[]} envelopes    - CloudEvent envelopes (from toCloudEventEnvelope())
+ * @param {object}   correlations - { session_id, agent_run_id, workflow_run_id, task_run_id, task_id }
+ * @param {object}   [options]
+ * @param {string}   [options.storeRoot]  - Override artifact root (default: DEFAULT_APPEND_ONLY_EVENT_STORE_OUT_DIR parent)
+ * @param {boolean}  [options.dryRun]     - Transform but do not write
+ * @param {string}   [options.runAt]      - ISO timestamp override
+ * @returns {Promise<object>} WriteResult with evidence record
+ */
+export async function appendRuntimeSessionStoredEvents(envelopes, correlations, options = {}) {
+  const {
+    storeRoot = path.join(path.dirname(DEFAULT_APPEND_ONLY_EVENT_STORE_OUT_DIR), RUNTIME_SESSION_STORE_SUBDIR),
+    dryRun = false,
+    runAt = new Date().toISOString(),
+  } = options;
+
+  const { session_id, agent_run_id = null, workflow_run_id = null, task_run_id = null, task_id = null } = correlations;
+
+  const sessionDir = path.resolve(storeRoot, session_id);
+  const storePath = path.join(sessionDir, RUNTIME_SESSION_STORED_EVENTS_FILENAME);
+
+  // Read existing stored-event IDs for idempotency
+  const existingIds = new Set();
+  let existingLineCount = 0;
+  let previousChainHash = null;
+
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    existingLineCount = lines.length;
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.event_envelope_id) existingIds.add(parsed.event_envelope_id);
+        if (parsed.chain_hash) previousChainHash = parsed.chain_hash;  // last known chain tip
+      } catch { /* skip malformed */ }
+    }
+  }
+
+  // Build new stored-events (only for envelopes not yet in the store)
+  const newStoredEvents = [];
+  let appendSequence = existingLineCount + 1;
+
+  for (const envelope of envelopes) {
+    if (existingIds.has(envelope.id)) continue;  // idempotent skip
+
+    // Enrich envelope extensions with correlation refs for readback
+    const enrichedEnvelope = {
+      ...envelope,
+      // CloudEvents extensions (lowercase, no hyphens) carry correlation refs
+      sessionid: session_id,
+      agentrunid: agent_run_id ?? envelope.extensions?.agent_run_id ?? null,
+      workflowrunid: workflow_run_id ?? envelope.extensions?.workflow_run_id ?? null,
+      taskrunid: task_run_id ?? envelope.extensions?.task_run_id ?? null,
+      taskid: task_id ?? envelope.extensions?.task_id ?? null,
+    };
+
+    const storedEvent = buildStoredEvent({
+      envelope: enrichedEnvelope,
+      typeBinding: null,       // runtime events do not have event-type-registry bindings yet
+      appendSequence,
+      previousChainHash,
+      generatedAt: runAt,
+    });
+
+    // Override type_binding_status for runtime events (no registry binding required)
+    storedEvent.type_binding_status = "runtime_session_event";
+    storedEvent.runtime_session_store = true;
+
+    previousChainHash = storedEvent.chain_hash;
+    appendSequence++;
+    newStoredEvents.push(storedEvent);
+  }
+
+  const writeResult = {
+    schema_version: RUNTIME_SESSION_STORE_SCHEMA_VERSION,
+    written_at: runAt,
+    session_id,
+    agent_run_id,
+    workflow_run_id,
+    task_run_id,
+    task_id,
+    store_path: storePath,
+    store_authority: "CANONICAL_AUTHORITY",
+    authority_module: "src/append-only-event-store.mjs",
+    authority_note: "stored-events built by buildStoredEvent() + hashObject() from existing append-only-event-store.mjs — same schema as batch pipeline",
+    is_dry_run: dryRun,
+    pre_append_line_count: existingLineCount,
+    appended_count: newStoredEvents.length,
+    skipped_duplicate_count: envelopes.length - newStoredEvents.length,
+    total_after_append: existingLineCount + newStoredEvents.length,
+    immutable_append: true,
+    hash_chained: true,
+    correlation_refs: { session_id, agent_run_id, workflow_run_id, task_run_id, task_id },
+  };
+
+  if (!dryRun && newStoredEvents.length > 0) {
+    await mkdir(sessionDir, { recursive: true });
+    const lines = newStoredEvents.map(e => JSON.stringify(e)).join("\n") + "\n";
+    await appendFile(storePath, lines, "utf8");
+  }
+
+  return writeResult;
+}
+
+/**
+ * Replay stored-events from the existing canonical authority path for a session.
+ *
+ * Reads from:
+ *   artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+ *
+ * Returns stored-event records with appendSequence > afterSeq (in order, no gaps).
+ * Preserves session/agent/workflow/task correlations on every record.
+ *
+ * @param {string} sessionId
+ * @param {object} [options]
+ * @param {number} [options.afterSeq]  - Return only stored-events with appendSequence > afterSeq
+ * @param {string} [options.storeRoot] - Override artifact root
+ * @returns {Promise<object>} { stored_events, readback_path, total_count, returned_count, no_gaps, authority }
+ */
+export async function replayRuntimeSessionStoredEvents(sessionId, options = {}) {
+  const {
+    afterSeq = -1,
+    storeRoot = path.join(path.dirname(DEFAULT_APPEND_ONLY_EVENT_STORE_OUT_DIR), RUNTIME_SESSION_STORE_SUBDIR),
+  } = options;
+
+  const storePath = path.resolve(storeRoot, sessionId, RUNTIME_SESSION_STORED_EVENTS_FILENAME);
+
+  let allStoredEvents = [];
+  if (existsSync(storePath)) {
+    const raw = await readFile(storePath, "utf8");
+    const lines = raw.split("\n").filter(l => l.trim() !== "");
+    for (const line of lines) {
+      try { allStoredEvents.push(JSON.parse(line)); } catch { /* skip */ }
+    }
+  }
+
+  const returned = allStoredEvents.filter(e => (e.global_sequence ?? -1) > afterSeq);
+
+  // Verify monotonic global_sequence / no gaps in returned window
+  const sequences = returned.map(e => e.global_sequence).filter(n => typeof n === "number");
+  let noGaps = true;
+  for (let i = 1; i < sequences.length; i++) {
+    if (sequences[i] !== sequences[i - 1] + 1) { noGaps = false; break; }
+  }
+
+  return {
+    session_id: sessionId,
+    readback_path: storePath,
+    authority: "append-only-event-store.mjs:appendRuntimeSessionStoredEvents",
+    store_schema: RUNTIME_SESSION_STORE_SCHEMA_VERSION,
+    total_count: allStoredEvents.length,
+    after_seq: afterSeq,
+    returned_count: returned.length,
+    no_gaps: noGaps,
+    monotonic_seq_verified: noGaps && returned.length > 0,
+    stored_events: returned,
+    correlation_refs_present: returned.length === 0 ? null : {
+      has_session_id: returned.every(e => Boolean(e.event_envelope_id)),
+      has_agent_run_id: returned.some(e => e.agentrunid != null),
+      has_workflow_run_id: returned.some(e => e.workflowrunid != null),
+    },
+  };
 }
 
 function parseArgs(argv) {

@@ -71,6 +71,13 @@ import {
 import { getAdapter } from "./native-session-adapter-contract.mjs";
 import { appendRuntimeSessionEvents } from "./runtime-session-event-bridge.mjs";
 import { appendToCanonicalEventStore } from "./runtime-session-canonical-write-path.mjs";
+import {
+  appendRuntimeSessionStoredEvents,
+  replayRuntimeSessionStoredEvents,
+  RUNTIME_SESSION_STORE_SUBDIR,
+  DEFAULT_APPEND_ONLY_EVENT_STORE_OUT_DIR,
+} from "./append-only-event-store.mjs";
+import { toCloudEventEnvelope } from "./runtime-session-event-bridge.mjs";
 
 export const DEFAULT_SUPERVISOR_CONFIG = {
   heartbeat_timeout_ms: 120_000,   // 2 min — from adapter lifecycle.heartbeat_seconds=60 * 2x
@@ -81,6 +88,9 @@ export const DEFAULT_SUPERVISOR_CONFIG = {
   detach_child: true,
   // R1D: publish to canonical event bridge
   event_bridge_enabled: true,
+  // R5A: canonical stored-events store root — defaults to the append-only-event-store authority path
+  // Set this in tests to redirect to a temp dir
+  canonical_store_root: null,   // null = use default from append-only-event-store.mjs
 };
 
 // ─── Main entry point ──────────────────────────────────────────────────────
@@ -669,18 +679,23 @@ export function proveProcessExitNotTaskCompletion() {
  * reconnectFromDisk — R2A Client-B reconnect path.
  *
  * Called by a DIFFERENT OS process (client-B) after client-A has exited.
- * Reads the session snapshot and events from disk, computes missed events
- * since cursorSeq, and returns the full reconciliation window.
+ * Reads the session snapshot and missed events from the EXISTING canonical
+ * append-only-event-store authority path (R5B repair):
+ *   artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+ *
+ * R5B repair: missed events are read from the existing canonical authority
+ * (replayRuntimeSessionStoredEvents) instead of events.json projection cache.
  *
  * This is the real separate-process reconnect path. It does NOT require
  * an in-memory handle — it works purely from persistent disk state.
  *
  * @param {string} sessionId         - Session to reconnect to
- * @param {number} cursorSeq         - Last event seq client-A saw
+ * @param {number} cursorSeq         - Last global_sequence client-A saw (0 = none)
  * @param {string} [outDir]          - Session out dir (default: DEFAULT_RUNTIME_SESSION_OUT_DIR)
- * @returns {object} { snapshot, missed_events, events_total, cursor_seq, reconnected_at }
+ * @param {string} [storeRoot]       - Canonical store root (default: per append-only-event-store)
+ * @returns {object} { snapshot, missed_stored_events, missed_count, events_total, cursor_seq, reconnected_at, canonical_authority }
  */
-export async function reconnectFromDisk(sessionId, cursorSeq, { outDir } = {}) {
+export async function reconnectFromDisk(sessionId, cursorSeq, { outDir, storeRoot } = {}) {
   const dir = path.resolve(outDir ?? DEFAULT_RUNTIME_SESSION_OUT_DIR, sessionId);
 
   // Read snapshot
@@ -692,28 +707,29 @@ export async function reconnectFromDisk(sessionId, cursorSeq, { outDir } = {}) {
     throw new Error(`reconnectFromDisk: cannot read snapshot for ${sessionId}: ${e.message}`);
   }
 
-  // Read events (projection cache — used for cursor reconciliation)
-  let events = [];
-  try {
-    const raw = await readFile(path.join(dir, "events.json"), "utf8");
-    const parsed = JSON.parse(raw);
-    // events.json is written as {schema_version, session_id, events: [...]}
-    events = parsed.events ?? (Array.isArray(parsed) ? parsed : []);
-  } catch {
-    events = [];
-  }
-
-  // Compute missed events since cursorSeq
-  const missed_events = events.filter(e => (e.seq ?? -1) > cursorSeq);
+  // R5B: Read missed events from the existing canonical authority path instead of events.json
+  // artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+  const replayResult = await replayRuntimeSessionStoredEvents(sessionId, {
+    afterSeq: cursorSeq,
+    ...(storeRoot ? { storeRoot } : {}),
+  });
 
   return {
     snapshot,
-    missed_events,
-    events_total: events.length,
+    // R5B: canonical stored-events (not events.json projection cache)
+    missed_stored_events: replayResult.stored_events,
+    missed_count: replayResult.returned_count,
+    events_total: replayResult.total_count,
     cursor_seq: cursorSeq,
     reconnected_at: new Date().toISOString(),
     session_id: sessionId,
     runtime_state: snapshot.runtime_state,
+    // R5B evidence fields
+    canonical_authority: replayResult.authority,
+    readback_path: replayResult.readback_path,
+    no_gaps: replayResult.no_gaps,
+    monotonic_seq_verified: replayResult.monotonic_seq_verified,
+    correlation_refs_present: replayResult.correlation_refs_present,
   };
 }
 
@@ -812,9 +828,23 @@ async function persistSession(session, config, onSnapshot) {
     appendRuntimeSessionEvents(session, {}).catch(noop);
   }
 
-  // R4A: append to canonical event store JSONL (CANONICAL_AUTHORITY)
-  // artifacts/runtime-session-events/<session_id>/event-store.jsonl
+  // R4A: append to canonical event store JSONL (R4 per-session buffer — kept for audit trail)
   appendToCanonicalEventStore(session, {}).catch(noop);
+
+  // R5A: append to EXISTING append-only-event-store.mjs authority path using
+  //      buildStoredEvent() + hashObject() — same schema as batch pipeline.
+  //      artifacts/append-only-event-store/runtime-sessions/<session_id>/stored-events.jsonl
+  const envelopes = session._events.map(e => toCloudEventEnvelope(e, session));
+  const correlations = {
+    session_id: session.session_id,
+    agent_run_id: session.agent_run_id ?? null,
+    workflow_run_id: session.workflow_run_id ?? null,
+    task_run_id: session.task_run_id ?? null,
+    task_id: session.task_id,
+  };
+  appendRuntimeSessionStoredEvents(envelopes, correlations, {
+    ...(config.canonical_store_root ? { storeRoot: config.canonical_store_root } : {}),
+  }).catch(noop);
 
   return result;
 }

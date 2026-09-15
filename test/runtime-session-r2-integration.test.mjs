@@ -254,7 +254,8 @@ const sessionId = ${JSON.stringify(handoff.session_id)};
 const cursorSeq = ${JSON.stringify(handoff.cursor_seq)};
 const sessionOutDir = ${JSON.stringify(sessionOutDir)};
 
-// CLIENT-B: reconnect from disk — reads snapshot + events, computes missed events
+// CLIENT-B: reconnect from disk — reads snapshot + canonical stored-events, computes missed events
+// R5B: reconnectFromDisk now reads from existing canonical authority (append-only-event-store)
 const reconnectResult = await reconnectFromDisk(sessionId, cursorSeq, { outDir: sessionOutDir });
 
 process.stdout.write(JSON.stringify({
@@ -262,11 +263,14 @@ process.stdout.write(JSON.stringify({
   pid: process.pid,
   session_id: reconnectResult.session_id,
   runtime_state: reconnectResult.runtime_state,
-  missed_events_count: reconnectResult.missed_events.length,
+  missed_events_count: (reconnectResult.missed_stored_events ?? reconnectResult.missed_events ?? []).length,
   events_total: reconnectResult.events_total,
   cursor_seq: cursorSeq,
   reconnected_at: reconnectResult.reconnected_at,
-  missed_event_types: reconnectResult.missed_events.map(e => e.type),
+  // R5B: stored-event records use event_type (not type); canonical_authority field present
+  missed_event_types: (reconnectResult.missed_stored_events ?? reconnectResult.missed_events ?? []).map(e => e.event_type ?? e.type),
+  canonical_authority: reconnectResult.canonical_authority ?? null,
+  no_gaps: reconnectResult.no_gaps ?? null,
 }) + "\\n");
 process.exit(0);
 `, "utf8");
