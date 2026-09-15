@@ -70,6 +70,7 @@ import {
 
 import { getAdapter } from "./native-session-adapter-contract.mjs";
 import { appendRuntimeSessionEvents } from "./runtime-session-event-bridge.mjs";
+import { appendToCanonicalEventStore } from "./runtime-session-canonical-write-path.mjs";
 
 export const DEFAULT_SUPERVISOR_CONFIG = {
   heartbeat_timeout_ms: 120_000,   // 2 min — from adapter lifecycle.heartbeat_seconds=60 * 2x
@@ -806,10 +807,14 @@ async function persistSession(session, config, onSnapshot) {
   const result = await writeRuntimeSession(session, config.session_out_dir);
   onSnapshot?.(buildSessionSnapshot(session), result);
 
-  // R1D: publish to canonical event bridge
+  // R1D: publish to canonical event bridge (supplementary bridge record)
   if (config.event_bridge_enabled !== false) {
     appendRuntimeSessionEvents(session, {}).catch(noop);
   }
+
+  // R4A: append to canonical event store JSONL (CANONICAL_AUTHORITY)
+  // artifacts/runtime-session-events/<session_id>/event-store.jsonl
+  appendToCanonicalEventStore(session, {}).catch(noop);
 
   return result;
 }

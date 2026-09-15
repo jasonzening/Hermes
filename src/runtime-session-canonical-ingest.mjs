@@ -51,6 +51,20 @@
  *   in-memory _events array. It is suitable for local inspection and reconnect
  *   reconciliation. It is NOT the canonical event log. Do not use it as the
  *   primary event authority. Canonical readback comes from replayFromCanonicalStore().
+ *
+ * R4A RECLASSIFICATION (ARF-001-R4):
+ *   The store written by ingestSessionToCanonicalStore() at
+ *   artifacts/runtime-session-canonical-store/canonical-runtime-session-store.json
+ *   is now explicitly classified as STAGING_BUFFER — NOT the canonical authority.
+ *
+ *   The canonical authority for RuntimeSession event readback/replay is:
+ *     artifacts/runtime-session-events/<session_id>/event-store.jsonl
+ *   written by appendToCanonicalEventStore() in runtime-session-canonical-write-path.mjs.
+ *
+ *   STAGING_BUFFER: ingestSessionToCanonicalStore() proves CloudEvent format
+ *   compatibility and append-only invariant semantics consistent with the
+ *   existing Hermes canonical primitives. It remains a valid staging/testing
+ *   helper but MUST NOT be used as the primary event replay authority.
  */
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -62,6 +76,28 @@ import { toCloudEventEnvelope, LOCAL_EVENTS_JSON_CLASSIFICATION } from "./runtim
 
 export const CANONICAL_STORE_SCHEMA_VERSION = "runtime-session-canonical-store.v2";
 export const DEFAULT_CANONICAL_STORE_DIR = "artifacts/runtime-session-canonical-store";
+
+/**
+ * R4A: Explicit authority classification of the store written by this module.
+ *
+ * The store at artifacts/runtime-session-canonical-store/ is a STAGING_BUFFER.
+ * It proves format-compatibility and append-only invariant semantics consistent
+ * with the existing Hermes canonical primitives, but it is NOT the canonical
+ * event replay authority.
+ *
+ * The canonical authority is:
+ *   artifacts/runtime-session-events/<session_id>/event-store.jsonl
+ *   (written by runtime-session-canonical-write-path.mjs)
+ */
+export const INGEST_STORE_AUTHORITY = "STAGING_BUFFER";
+export const INGEST_STORE_CLASSIFICATION = {
+  authority: "STAGING_BUFFER",
+  store_path: "artifacts/runtime-session-canonical-store/canonical-runtime-session-store.json",
+  note: "R4A: This store is a format-compatibility staging buffer, NOT the canonical authority. " +
+        "Canonical authority for event replay is artifacts/runtime-session-events/<session_id>/event-store.jsonl",
+  canonical_authority_module: "src/runtime-session-canonical-write-path.mjs",
+  canonical_authority_path: "artifacts/runtime-session-events/<session_id>/event-store.jsonl",
+};
 
 // ─── R3C: Existing canonical primitive references ─────────────────────────
 
